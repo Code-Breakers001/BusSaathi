@@ -1,0 +1,57 @@
+-- Day 2 setup for BusSaathi (Supabase)
+
+-- Fix: column was created as update_at by mistake
+alter table bus_positions rename column update_at to updated_at;
+
+-- Trigger: the database sets updated_at, not the phone
+create or replace function set_updated_at()
+returns trigger as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists bus_positions_set_updated_at on bus_positions;
+
+create trigger bus_positions_set_updated_at
+before insert or update on bus_positions
+for each row execute function set_updated_at();
+
+-- Realtime
+alter publication supabase_realtime add table bus_positions;
+alter table bus_positions replica identity full;
+
+-- Row Level Security
+alter table routes enable row level security;
+alter table stops enable row level security;
+alter table buses enable row level security;
+alter table bus_positions enable row level security;
+
+create policy "read routes" on routes for select using (true);
+create policy "read stops" on stops for select using (true);
+create policy "read buses" on buses for select using (true);
+create policy "read positions" on bus_positions for select using (true);
+
+create policy "insert positions" on bus_positions
+  for insert with check (true);
+create policy "update positions" on bus_positions
+  for update using (true) with check (true);
+
+-- Fake test route (replace with Aadena's real route on Day 3)
+update routes
+set path = '[
+  {"lat": 9.9937, "lng": 76.3000},
+  {"lat": 9.9995, "lng": 76.3035},
+  {"lat": 10.0053, "lng": 76.3070},
+  {"lat": 10.0160, "lng": 76.3075},
+  {"lat": 10.0250, "lng": 76.3080}
+]'::jsonb
+where id = 1;
+
+insert into stops (route_id, name, landmark, lat, lng, stop_order) values
+(1, 'Kaloor', 'Near the stadium', 9.9937, 76.3000, 1),
+(1, 'Palarivattom', 'Near the bypass junction', 10.0053, 76.3070, 2),
+(1, 'Edappally', 'Edappally junction', 10.0250, 76.3080, 3);
+
+update bus_positions set lat = 9.9937, lng = 76.3000, speed = 20 where bus_id = 1;
