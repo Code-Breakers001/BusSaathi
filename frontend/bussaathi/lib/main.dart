@@ -1,10 +1,22 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
-void main() => runApp(const BusSaathiApp());
+const supabaseUrl = String.fromEnvironment('SUPABASE_URL');
+const supabaseAnonKey = String.fromEnvironment('SUPABASE_ANON_KEY');
+
+const int kBusId = 1;
+const int kRouteId = 1;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Supabase.initialize(url: supabaseUrl, anonKey: supabaseAnonKey);
+  runApp(const BusSaathiApp());
+}
 
 class BusSaathiApp extends StatelessWidget {
   const BusSaathiApp({super.key});
@@ -27,74 +39,203 @@ class MapScreen extends StatefulWidget {
 
 class _MapScreenState extends State<MapScreen> {
   final MapController _mapController = MapController();
-  StreamSubscription<Position>? _sub;
+  final SupabaseClient _db = Supabase.instance.client;
+
+  List<LatLng> _routePoints = [];
   LatLng? _busPosition;
-  String _status = 'Starting...';
+  DateTime? _busUpdatedAt;
+
+  bool _driverMode = false; // true = this phone sends its GPS
+  StreamSubscription<Position>? _gpsSub;
+  Timer? _pollTimer;
+
+  String _routeStatus = 'Loading route...';
+  String _busStatus = 'Waiting for bus...';
+  String _sendStatus = '';
 
   @override
   void initState() {
     super.initState();
-    _startTracking();
+    _loadRoute();
+    _fetchBus();
+    _pollTimer = Timer.periodic(const Duration(seconds: 3), (_) => _fetchBus());
   }
 
-  Future<void> _startTracking() async {
-    final serviceOn = await Geolocator.isLocationServiceEnabled();
-    if (!serviceOn) {
-      setState(() => _status = 'Turn on Location (GPS) in phone settings');
+  // ---------- Route ----------
+  Future<void> _loadRoute() async {
+    try {
+      final row =
+          await _db.from('routes').select().eq('id', kRouteId).single();
+      var raw = row['path'];
+      if (raw is String) raw = jsonDecode(raw);
+
+      final points = <LatLng>[];
+      if (raw is List) {
+        for (final p in raw) {
+          points.add(LatLng((p['lat'] as num).toDouble(),
+              (p['lng'] as num).toDouble()));
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _routePoints = points;
+        _routeStatus = points.isEmpty
+            ? 'Route has no points yet'
+            : 'Route: ${row['name']} (${points.length} points)';
+      });
+      if (points.length >= 2) {
+        _mapController.fitCamera(CameraFit.bounds(
+          bounds: LatLngBounds.fromPoints(points),
+          padding: const EdgeInsets.all(48),
+        ));
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _routeStatus = 'Route failed: $e');
+    }
+  }
+
+  // ---------- Bus position (read) ----------
+  Future<void> _fetchBus() async {
+    try {
+      final row = await _db
+          .from('bus_positions')
+          .select()
+          .eq('bus_id', kBusId)
+          .maybeSingle();
+      if (row == null) {
+        if (mounted) setState(() => _busStatus = 'No position for bus yet');
+        return;
+      }
+      final pos = LatLng((row['lat'] as num).toDouble(),
+          (row['lng'] as num).toDouble());
+      final updated = DateTime.tryParse('${row['updated_at']}')?.toLocal();
+      if (!mounted) return;
+      setState(() {
+        _busPosition = pos;
+        _busUpdatedAt = updated;
+        _busStatus = updated == null
+            ? 'Bus seen'
+            : 'Bus last seen ${_ago(updated)}';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _busStatus = 'Bus read failed: $e');
+    }
+  }
+
+  String _ago(DateTime t) {
+    final s = DateTime.now().difference(t).inSeconds;
+    if (s < 60) return '${s < 0 ? 0 : s}s ago';
+    if (s < 3600) return '${s ~/ 60} min ago';
+    return '${s ~/ 3600} h ago';
+  }
+
+  // ---------- Driver mode (write) ----------
+  Future<void> _setDriverMode(bool on) async {
+    setState(() => _driverMode = on);
+    if (!on) {
+      await _gpsSub?.cancel();
+      _gpsSub = null;
+      setState(() => _sendStatus = '');
       return;
     }
 
+    if (!await Geolocator.isLocationServiceEnabled()) {
+      setState(() {
+        _driverMode = false;
+        _sendStatus = 'Turn on Location (GPS) in phone settings';
+      });
+      return;
+    }
     var permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
     }
     if (permission == LocationPermission.denied ||
         permission == LocationPermission.deniedForever) {
-      setState(() => _status = 'Location permission denied');
+      setState(() {
+        _driverMode = false;
+        _sendStatus = 'Location permission denied';
+      });
       return;
     }
 
-    setState(() => _status = 'Waiting for GPS...');
-
-    _sub = Geolocator.getPositionStream(
+    setState(() => _sendStatus = 'Waiting for GPS...');
+    _gpsSub = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.high,
         distanceFilter: 5,
       ),
-    ).listen((Position p) {
-      final point = LatLng(p.latitude, p.longitude);
-      setState(() {
-        _busPosition = point;
-        _status = 'Live: ${p.latitude.toStringAsFixed(5)}, '
-            '${p.longitude.toStringAsFixed(5)}';
-      });
-      _mapController.move(point, 16);
-    });
+    ).listen(_sendPosition);
+  }
+
+  Future<void> _sendPosition(Position p) async {
+    try {
+      await _db.from('bus_positions').upsert({
+        'bus_id': kBusId,
+        'lat': p.latitude,
+        'lng': p.longitude,
+        'speed': p.speed,
+      }, onConflict: 'bus_id');
+      if (!mounted) return;
+      setState(() => _sendStatus =
+          'Sent to server at ${TimeOfDay.now().format(context)}');
+      _fetchBus();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _sendStatus = 'Send failed: $e');
+    }
   }
 
   @override
   void dispose() {
-    _sub?.cancel();
+    _gpsSub?.cancel();
+    _pollTimer?.cancel();
     super.dispose();
   }
 
+  // ---------- UI ----------
   @override
   Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.of(context).viewPadding.bottom;
+    final statusLines = [
+      _routeStatus,
+      _busStatus,
+      if (_sendStatus.isNotEmpty) _sendStatus,
+    ].join('\n');
+
     return Scaffold(
-      appBar: AppBar(title: const Text('BusSaathi Map')),
+      appBar: AppBar(
+        title: const Text('BusSaathi'),
+        actions: [
+          const Center(child: Text('Driver')),
+          Switch(value: _driverMode, onChanged: _setDriverMode),
+        ],
+      ),
       body: Stack(
         children: [
           FlutterMap(
             mapController: _mapController,
             options: const MapOptions(
-              initialCenter: LatLng(9.9312, 76.2673),
-              initialZoom: 14,
+              initialCenter: LatLng(11.2588, 75.7804),
+              initialZoom: 13,
             ),
             children: [
               TileLayer(
                 urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                 userAgentPackageName: 'com.example.bussaathi',
               ),
+              if (_routePoints.length >= 2)
+                PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: _routePoints,
+                      strokeWidth: 5,
+                      color: Colors.blue,
+                    ),
+                  ],
+                ),
               if (_busPosition != null)
                 MarkerLayer(
                   markers: [
@@ -112,11 +253,11 @@ class _MapScreenState extends State<MapScreen> {
           Positioned(
             left: 8,
             right: 8,
-            bottom: 8,
+            bottom: 8 + bottomInset,
             child: Container(
               padding: const EdgeInsets.all(8),
               color: Colors.black87,
-              child: Text(_status,
+              child: Text(statusLines,
                   style: const TextStyle(color: Colors.white)),
             ),
           ),
