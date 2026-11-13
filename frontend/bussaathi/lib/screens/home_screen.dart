@@ -1,3 +1,4 @@
+import '../widgets/bus_map.dart';
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../data/bus_repository.dart';
@@ -65,11 +66,12 @@ class _HomeScreenState extends State<HomeScreen> {
               borderRadius: BorderRadius.circular(12),
             ),
             alignment: Alignment.center,
-            child: Text(
-              "Map goes here (Albin's map)",
-              style: TextStyle(color: scheme.onSecondaryContainer),
+            child:ClipRRect(
+            borderRadius: BorderRadius.circular(12),
+             child: const BusMap(),
+),
             ),
-          ),
+          
           Expanded(
             child: FutureBuilder<_HomeData>(
               future: _data,
